@@ -1,0 +1,9 @@
+{
+  "nfe_step": 6 ,
+  "cfg_strength": 0.5,
+  "speed": 1.0,
+  "target_rms": 0.1,
+  "cross_fade_duration": 0.15,
+  "sway_sampling_coef": -1.0,
+  "remove_silence": false
+}

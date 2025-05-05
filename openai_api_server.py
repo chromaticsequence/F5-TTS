@@ -1,5 +1,6 @@
 import io
 import os
+import json # Add json import
 import soundfile as sf
 import whisper # Re-add whisper
 import torch
@@ -7,6 +8,7 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
+# Removed cached_path import
 
 # Assuming F5TTS class is accessible via this import path
 # Adjust if necessary based on your project structure
@@ -15,8 +17,8 @@ from f5_tts.api import F5TTS
 # --- Configuration ---
 # German model details from aihpi/F5-TTS-German
 HF_REPO_ID = "aihpi/F5-TTS-German"
-MODEL_CHECKPOINT = "F5TTS_Base/model_420000.safetensors" # Using highest step checkpoint
-MODEL_VOCAB = "F5TTS_Base/vocab.txt" # Assuming vocab is in the same dir
+MODEL_CHECKPOINT = "F5TTS_Base/model_295000.safetensors" # Trying the earliest checkpoint
+MODEL_VOCAB = "vocab.txt" # Assuming vocab is at the repo root
 MODEL_CONFIG_NAME = "F5TTS_Base" # Base model config used for finetuning
 
 REFERENCE_AUDIO_PATH = "voice_wav/ElevenLabs_2025-05-04T17_00_01_Brian_pre_sp100_s50_sb75_se0_b_m2.wav" # User's German reference
@@ -30,8 +32,9 @@ else:
 
 # --- Global Variables ---
 f5tts_model: F5TTS = None
-whisper_model: whisper.Whisper = None # Re-add whisper model global
-reference_text: str = None # Will be transcribed
+whisper_model: whisper.Whisper = None
+reference_text: str = None
+processed_ref_audio_path: str = None # Store path to potentially clipped audio
 target_sample_rate: int = None
 
 # --- Pydantic Models ---
@@ -65,32 +68,75 @@ def transcribe_reference(audio_path):
 # --- FastAPI Lifespan Events ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load models and transcribe on startup
-    global f5tts_model, reference_text, target_sample_rate, whisper_model
+    # Load models and preprocess/transcribe reference audio on startup
+    global f5tts_model, reference_text, target_sample_rate, whisper_model, processed_ref_audio_path
     print("Server starting up...")
     print(f"Using device: {DEVICE}")
 
     if not os.path.exists(REFERENCE_AUDIO_PATH):
          raise FileNotFoundError(f"Reference audio file not found: {REFERENCE_AUDIO_PATH}")
 
-    # Transcribe reference audio first
-    reference_text = transcribe_reference(REFERENCE_AUDIO_PATH)
+    # --- Preprocess Reference Audio FIRST ---
+    # This function clips the audio if needed and returns the path to the
+    # potentially temporary clipped file, along with empty text if transcription is needed.
+    # We need to import the function. Let's assume it's available.
+    # We might need to adjust imports if this fails.
+    try:
+        from f5_tts.infer.utils_infer import preprocess_ref_audio_text
+        print(f"Preprocessing reference audio: {REFERENCE_AUDIO_PATH}...")
+        # Pass empty string for ref_text to trigger transcription if needed later
+        processed_ref_audio_path, ref_text_from_preprocess = preprocess_ref_audio_text(
+            REFERENCE_AUDIO_PATH, "", clip_short=True, show_info=print
+        )
+        print(f"Reference audio processed. Using path: {processed_ref_audio_path}")
+    except ImportError:
+         raise RuntimeError("Could not import preprocess_ref_audio_text. Check installation.")
+    except Exception as e:
+        print(f"Error during reference audio preprocessing: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to preprocess reference audio: {e}")
 
-    # Load F5TTS model using paths from the German repo
+    # --- Transcribe the PROCESSED audio if needed ---
+    if not ref_text_from_preprocess.strip():
+        print("Transcription required for processed reference audio...")
+        reference_text = transcribe_reference(processed_ref_audio_path) # Transcribe the clipped audio
+    else:
+        # This case shouldn't happen if we pass "" above, but handle defensively
+        print("Using reference text determined during preprocessing (unexpected).")
+        reference_text = ref_text_from_preprocess
+
+    # --- Load F5TTS model ---
     print(f"Loading German F5TTS model: {HF_REPO_ID}/{MODEL_CHECKPOINT}...")
     try:
-        # Construct full HF paths
-        ckpt_file_hf = f"hf://{HF_REPO_ID}/{MODEL_CHECKPOINT}"
-        vocab_file_hf = f"hf://{HF_REPO_ID}/{MODEL_VOCAB}"
+        # Define local paths using the cloned repo
+        local_ckpt_path = os.path.join("german_model_repo", MODEL_CHECKPOINT)
+        local_vocab_path = os.path.join("german_model_repo", MODEL_VOCAB)
+
+        print(f"Using local checkpoint: {local_ckpt_path}")
+        print(f"Using local vocab file: {local_vocab_path}")
+
+        # Ensure local files exist before loading
+        if not os.path.exists(local_ckpt_path):
+            raise FileNotFoundError(f"Local checkpoint file not found: {local_ckpt_path}")
+        if not os.path.exists(local_vocab_path):
+             raise FileNotFoundError(f"Local vocab file not found: {local_vocab_path}")
 
         f5tts_model = F5TTS(
-            model=MODEL_CONFIG_NAME, # Use the base config name
-            ckpt_file=ckpt_file_hf,  # Path to the specific German checkpoint
-            vocab_file=vocab_file_hf,# Path to the specific German vocab
+            model=MODEL_CONFIG_NAME,    # Use the base config name
+            ckpt_file=local_ckpt_path,  # Path to the local German checkpoint
+            vocab_file=local_vocab_path,# Path to the local German vocab
             device=DEVICE
         )
         target_sample_rate = f5tts_model.target_sample_rate # Get sample rate from model
         print(f"German F5TTS model loaded. Target sample rate: {target_sample_rate} Hz.")
+        # Apply torch.compile optimization
+        print("Applying torch.compile() optimization...")
+        try:
+            # Note: Compilation might take time on first inference after startup
+            # Try specifying the inductor backend
+            f5tts_model = torch.compile(f5tts_model, backend='inductor')
+            print("torch.compile(backend='inductor') applied successfully.")
+        except Exception as compile_e:
+            print(f"Warning: torch.compile() failed: {compile_e}. Proceeding without optimization.")
     except Exception as e:
         print(f"Error loading German F5TTS model: {e}")
         # Allow server to start but endpoint will fail
@@ -124,14 +170,26 @@ async def create_speech(request: TTSRequest):
 
     print(f"Received request to synthesize: '{request.input}'")
 
+    # Load parameters from JSON file for each request
+    params_file = "inference_params.json"
     try:
-        # Perform inference
+        with open(params_file, 'r') as f:
+            params = json.load(f)
+        print(f"Loaded inference parameters: {params}")
+    except FileNotFoundError:
+        print(f"Warning: '{params_file}' not found. Using default inference parameters.")
+        params = {} # Use defaults if file not found
+    except json.JSONDecodeError:
+        print(f"Error: Could not decode '{params_file}'. Using default inference parameters.")
+        params = {} # Use defaults if JSON is invalid
+
+    try:
+        # Perform inference using loaded parameters
         wav, sr, _ = f5tts_model.infer(
-            ref_file=REFERENCE_AUDIO_PATH,
-            ref_text=reference_text,
+            ref_file=processed_ref_audio_path, # Use the processed (potentially clipped) audio path
+            ref_text=reference_text,           # Use the corresponding transcription
             gen_text=request.input,
-            # nfe_step=16, # Removed to use default for potentially better quality
-            # Use default inference parameters from F5TTS class or adjust as needed
+            **params # Pass parameters loaded from JSON
             # show_info=print # Optional: uncomment for more verbose logging
         )
 
